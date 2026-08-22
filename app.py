@@ -541,11 +541,36 @@ def display_student_source_excerpts(sources):
             args=(1, len(excerpts)),
         )
 
-    with st.container(height=240, border=True):
+    with st.container(height=720, border=True):
         st.markdown(
             f"**📄 {current_excerpt['file']} "
             f"— p.{current_excerpt['page']}**"
         )
+
+        pdf_path = PDF_DIR / current_excerpt["file"]
+
+        try:
+            page_number = int(current_excerpt["page"])
+            modified_time_ns = pdf_path.stat().st_mtime_ns
+            page_image = render_pdf_page(
+                str(pdf_path),
+                page_number,
+                modified_time_ns,
+            )
+            st.image(
+                page_image,
+                caption=(
+                    f"{current_excerpt['file']} "
+                    f"- {page_number}페이지"
+                ),
+                width="stretch",
+            )
+        except (TypeError, ValueError, OSError, RuntimeError):
+            st.caption(
+                "PDF 원문 페이지 미리보기를 표시하지 못했습니다."
+            )
+
+        st.caption("AI가 참고한 부분")
         st.write(current_excerpt["excerpt"])
 
 

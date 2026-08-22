@@ -230,6 +230,23 @@ def extract_search_keywords(question: str):
         "설명해줘",
         "알려줘",
         "정의",
+        "요약",
+        "요약해줘",
+        "정리",
+        "정리해줘",
+        "내용",
+        "전체",
+        "전부",
+        "모든",
+        "자료",
+        "강의자료",
+        "pdf",
+        "문서",
+        "파일",
+        "선택한",
+        "핵심",
+        "전반적",
+        "전반적인",
     }
     particles = (
         "에서",
@@ -266,6 +283,27 @@ def extract_search_keywords(question: str):
             keywords.append(cleaned)
 
     return list(dict.fromkeys(keywords))
+
+
+def is_broad_summary_request(question: str):
+    """선택 자료 전체를 대상으로 하는 포괄적 요약 요청인지 확인합니다."""
+    normalized_question = " ".join(str(question or "").lower().split())
+    summary_signals = (
+        "요약",
+        "정리",
+        "핵심 내용",
+        "핵심내용",
+    )
+
+    if not any(
+        signal in normalized_question
+        for signal in summary_signals
+    ):
+        return False
+
+    # 요약 표현을 제외한 실제 주제어가 남으면 일반 질의로 처리합니다.
+    # 예: "단면계수를 요약해줘"는 단면계수 검색을 수행합니다.
+    return not extract_search_keywords(normalized_question)
 
 
 # =========================================================
@@ -374,6 +412,7 @@ class RAGChain:
                 sources.append({
                     "file": source,
                     "page": page,
+                    "excerpt": doc.page_content.strip(),
                 })
 
         return {
@@ -534,6 +573,12 @@ class RAGChain:
             "has_evidence": True/False
         }
         """
+
+        # "전체를 요약해줘"처럼 특정 검색어가 없는 요청은
+        # 유사도 검색 기준을 적용하지 않고 파일별 대표 내용을
+        # 고르게 선택하는 전용 요약 흐름으로 보냅니다.
+        if is_broad_summary_request(question):
+            return self.generate_summary()
 
         # ---------------------------------------------
         # 검색 + 유사도 점수
