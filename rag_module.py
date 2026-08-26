@@ -325,6 +325,102 @@ class RAGChain:
         self.summary_prompt = get_summary_prompt()
         self.quiz_llm = self.llm.with_structured_output(QuizSet)
 
+    def compare_retrieval_thresholds(
+        self,
+        question: str,
+        thresholds=(0.15, 0.25, 0.35),
+        k: int = 8,
+    ):
+        """같은 검색 결과를 여러 유사도 임계값으로 비교합니다.
+
+        답변 생성 모델은 호출하지 않고 검색 결과만 비교하므로,
+        임계값 조정 전 평가용으로 사용할 수 있습니다.
+        """
+        normalized_question = question.strip()
+
+        if not normalized_question:
+            raise ValueError("비교할 질문을 입력해주세요.")
+
+        if is_broad_summary_request(normalized_question):
+            return {
+                "broad_summary": True,
+                "question": normalized_question,
+                "comparisons": [],
+                "keyword_hits": 0,
+            }
+
+        normalized_thresholds = sorted({
+            float(threshold)
+            for threshold in thresholds
+            if 0.0 <= float(threshold) <= 1.0
+        })
+
+        if not normalized_thresholds:
+            raise ValueError("0과 1 사이의 임계값이 필요합니다.")
+
+        results = (
+            self.vectorstore
+            .similarity_search_with_relevance_scores(
+                normalized_question,
+                k=k,
+            )
+        )
+        results = sorted(
+            results,
+            key=lambda item: float(item[1]),
+            reverse=True,
+        )
+
+        keywords = extract_search_keywords(normalized_question)
+        keyword_hits = 0
+
+        if keywords:
+            keyword_hits = sum(
+                1
+                for doc in self.chunks
+                if any(
+                    keyword in doc.page_content.lower()
+                    for keyword in keywords
+                )
+            )
+
+        comparisons = []
+
+        for threshold in normalized_thresholds:
+            matched_results = [
+                (doc, score)
+                for doc, score in results
+                if float(score) >= threshold
+            ]
+            evidence = []
+
+            for doc, score in matched_results[:3]:
+                excerpt = " ".join(doc.page_content.split())
+                evidence.append({
+                    "file": doc.metadata.get("source", self.filename),
+                    "page": doc.metadata.get("page", "?"),
+                    "score": round(float(score), 3),
+                    "excerpt": excerpt[:180],
+                })
+
+            comparisons.append({
+                "threshold": threshold,
+                "matched_count": len(matched_results),
+                "top_score": (
+                    round(float(results[0][1]), 3)
+                    if results
+                    else None
+                ),
+                "evidence": evidence,
+            })
+
+        return {
+            "broad_summary": False,
+            "question": normalized_question,
+            "comparisons": comparisons,
+            "keyword_hits": keyword_hits,
+        }
+
     def generate_summary(self):
         """선택한 강의자료를 파일별 복습 노트 형태로 요약합니다."""
         source_names = list(dict.fromkeys(

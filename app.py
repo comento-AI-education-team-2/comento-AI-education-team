@@ -1601,6 +1601,88 @@ def show_professor_page():
                 use_container_width=True
             )
 
+        with st.expander("🧪 검색 임계값 비교 (교수자용)"):
+            st.caption(
+                "동일한 질문에서 0.15, 0.25, 0.35를 비교합니다. "
+                "답변 생성 없이 검색 결과만 확인하므로 LLM 답변 토큰은 "
+                "사용하지 않습니다."
+            )
+            evaluation_question = st.text_input(
+                "평가 질문",
+                placeholder="예: V-M 선도의 의미와 작성 방법은?",
+                key="threshold_evaluation_question",
+            )
+            compare_button = st.button(
+                "세 임계값 비교",
+                use_container_width=True,
+                key="compare_retrieval_thresholds",
+            )
+
+            if compare_button:
+                if not selected_documents:
+                    st.warning("먼저 강의자료를 저장하고 선택해주세요.")
+                elif not evaluation_question.strip():
+                    st.warning("평가할 질문을 입력해주세요.")
+                elif st.session_state.rag_chain is None:
+                    st.warning("먼저 PDF 강의자료를 분석해주세요.")
+                else:
+                    try:
+                        comparison = (
+                            st.session_state.rag_chain
+                            .compare_retrieval_thresholds(
+                                evaluation_question
+                            )
+                        )
+
+                        if comparison["broad_summary"]:
+                            st.info(
+                                "이 질문은 전체 요약 요청으로 감지됩니다. "
+                                "현재 앱에서는 유사도 임계값을 거치지 않고 "
+                                "전용 요약 흐름으로 처리합니다."
+                            )
+                        else:
+                            rows = [
+                                {
+                                    "임계값": item["threshold"],
+                                    "통과 청크 수": item["matched_count"],
+                                    "최고 유사도": item["top_score"],
+                                }
+                                for item in comparison["comparisons"]
+                            ]
+                            st.dataframe(
+                                rows,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.caption(
+                                "핵심어 직접 일치 청크: "
+                                f"{comparison['keyword_hits']}개 "
+                                "(유사도 임계값과 별도로 보완되는 근거)"
+                            )
+
+                            for item in comparison["comparisons"]:
+                                st.markdown(
+                                    f"**임계값 {item['threshold']:.2f}의 "
+                                    "상위 근거**"
+                                )
+
+                                if not item["evidence"]:
+                                    st.write("통과한 의미 검색 근거가 없습니다.")
+                                    continue
+
+                                for evidence in item["evidence"]:
+                                    st.write(
+                                        f"- {evidence['file']} / "
+                                        f"{evidence['page']}페이지 / "
+                                        f"점수 {evidence['score']}: "
+                                        f"{evidence['excerpt']}"
+                                    )
+                    except Exception as error:
+                        st.error(
+                            "임계값 비교 중 오류가 발생했습니다: "
+                            f"{error}"
+                        )
+
         st.divider()
 
         # =================================================
