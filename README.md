@@ -1,106 +1,135 @@
 # AI 학습지원 플랫폼
 
-> 교수자가 등록한 PDF 강의자료를 기반으로 학생의 학습과 교수자의 수업 준비를 지원하는 RAG 기반 교육 서비스입니다.
+강의자료(PDF)를 기반으로 교수·학생을 지원하는 RAG 기반 AI 교육 플랫폼입니다.
+업로드한 강의자료 안에서만 답을 찾아, 근거가 없는 내용은 지어내지 않습니다.
+AI 모델은 Google Gemini(무료 티어)를 사용합니다.
 
-## 배포 서비스
+---
 
-**[AI 학습지원 플랫폼 바로가기](https://comento-ai-education-team-6u3ysphln9jxml5yzen8wl.streamlit.app/)**
+## 주요 기능
 
-## 1. 서비스 개요
+### 역할 기반 접근
+- 교수/학생 두 가지 역할로 로그인하며, 화면과 권한이 분리됩니다.
+- 교수는 강의자료를 관리하고, 학생은 공개된 자료만 이용합니다.
 
-교수자는 여러 PDF 강의자료를 등록하고 학생 공개 여부를 설정할 수 있습니다. 학생은 공개된 강의자료를 선택하여 질문하거나 쉬운 설명과 학습 퀴즈를 제공받을 수 있습니다. AI 답변은 선택한 자료에서 검색한 내용을 바탕으로 생성되며, 관련 파일명과 페이지 등 출처를 함께 표시합니다.
+### 교수 기능
+- PDF 강의자료 업로드·삭제
+- 자료별 학생 공개 여부 설정
+- AI에게 질문하고 강의자료 근거로 답변 받기
+- 강의자료 요약(파일별 복습 노트 형태)
 
-### 주요 기능
+### 학생 기능
+- 공개된 강의자료 선택·다운로드
+- AI 질문하기, 쉽게 설명받기(답변 언어 선택 가능: 한국어/영어/한영 혼용)
+- 복습 퀴즈 풀기(OX 3문항 + 단답형 3문항, 자동 채점 및 해설)
+- 답변의 근거가 된 PDF 페이지를 이미지로 미리보기
 
-- 교수자·학생 역할별 로그인 및 화면 분리
-- 여러 PDF 강의자료 업로드·선택·삭제
-- 강의자료별 학생 공개·비공개 설정
-- 선택한 자료 기반 RAG 질의응답
-- 강의자료 핵심 내용 요약 및 학생용 쉬운 설명
-- OX·단답형 학습 퀴즈와 자동 채점
-- 답변 근거 파일명·페이지·본문 일부 표시
-- PDF 근거 페이지 미리보기 및 다운로드
-- 복수 채팅 생성·전환과 대화 기록 관리
-- 한국어·영어 답변 언어 선택
-- 근거가 부족한 경우 답변 생성을 제한하는 안전장치
+### 공통 기능
+- 실시간 스트리밍 답변(답이 생성되는 대로 화면에 표시)
+- 여러 채팅방 관리 및 대화 기록 저장
+- 출처 표시(파일명·페이지)와 근거 발췌
 
-## 2. 팀원별 역할
+---
 
-| 팀원 | 역할 | 담당 업무 |
-| --- | --- | --- |
-| 김영상 | 팀장 / AI Solutions Architect | 기준 프로토타입 선정, RAG 구조 및 인터페이스 설계, 프롬프트·근거 부족 처리 기준 통합 |
-| 최락현 | AI Engineer | RAG 기능 검증, 검색·답변 생성 로직 개선, 예외 처리 및 기능 테스트 |
-| 지유성 | Cloud/Infra Engineer | Streamlit Community Cloud 배포, 환경변수·의존성·배포 환경 점검 |
-| 오세윤 | Product Owner / QA | 사용자 요구사항과 MVP 범위 관리, 사용자 시나리오 및 기능 검수 |
+## 안정성·보안 기능
 
-## 3. 기술 구성
+- **비밀번호 해싱**: 비밀번호를 평문이 아닌 PBKDF2 해시로 저장
+- **로그인 잠금**: 5회 연속 실패 시 15분간 로그인 차단
+- **AI 호출 한도**: 계정당 하루 호출 횟수 제한으로 비용·남용 방지
+- **업로드 검증**: PDF 크기(20MB) 및 실제 파일 형식(매직바이트) 확인
+- **동시성 안전 저장**: 파일 락으로 여러 사용자가 동시에 써도 데이터 보호
+- **오류 처리·로깅**: 사용자에게는 친절한 메시지, 서버에는 상세 로그 기록
+- **환각 방지**: 유사도 기준을 넘는 근거가 없으면 답을 지어내지 않고 "근거를 찾지 못했습니다"로 응답
 
-- UI 및 애플리케이션: Streamlit
-- LLM 및 임베딩: OpenAI API, LangChain
-- 벡터 검색: FAISS
-- PDF 처리: PyMuPDF
-- 배포: Streamlit Community Cloud
-- 협업: GitHub Branch → Pull Request → Review → Merge
+---
 
-자세한 시스템 구조와 예외 처리 기준은 [`docs/architecture.md`](docs/architecture.md)에서 확인할 수 있습니다.
+## 성능 최적화
 
-## 4. 로컬 실행 방법
+- **벡터 인덱스 디스크 캐싱**: 한 번 분석한 PDF는 재시작 후에도 다시 임베딩하지 않음
+- **임베딩 배치 처리·재시도**: 대용량 PDF도 진행률을 표시하며 처리, 일시적 API 오류는 자동 재시도
+- **메모리 자동 정리**: 오래된 RAG 인덱스·채팅방을 자동 정리해 메모리 사용 억제
+- **한국어 친화 청크 분할**: 문장이 중간에 끊기지 않도록 분할해 검색 정확도 향상
 
-### 4.1 저장소 내려받기
+---
 
-```powershell
-git clone https://github.com/comento-AI-education-team-2/comento-AI-education-team.git
-cd comento-AI-education-team
+## 파일 구성
+
+| 파일 | 역할 |
+|------|------|
+| `app.py` | 메인 앱(로그인, 화면, 채팅, 자료 관리) |
+| `rag_module.py` | PDF 처리, 임베딩, 검색, 답변·요약·퀴즈 생성 |
+| `security.py` | 비밀번호·로그인 잠금·호출 한도·업로드 검증·API 키 설정 |
+| `storage.py` | 동시성 안전 JSON 저장소 |
+| `app_logging.py` | 로깅 설정 |
+| `threshold_test.py` | 유사도 임계값 측정용 진단 스크립트(선택) |
+| `requirements.txt` | 의존 패키지 목록 |
+| `.env.example` | 환경변수 예시 |
+
+---
+
+## 실행 방법
+
+### 1. 가상환경 생성 및 활성화
+
+```bash
+python -m venv .venv
 ```
 
-### 4.2 가상환경 생성 및 실행
+- Windows: `.venv\Scripts\activate`
+- macOS / Linux: `source .venv/bin/activate`
 
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-```
+### 2. 패키지 설치
 
-### 4.3 패키지 설치
-
-```powershell
-python -m pip install --upgrade pip
+```bash
 pip install -r requirements.txt
 ```
 
-### 4.4 API 키 등록
+### 3. API 키 설정
 
-프로젝트 최상위 폴더에 `.env` 파일을 만들고 다음 내용을 입력합니다. 값에 쌍따옴표는 필요하지 않습니다.
+`.env.example`을 복사해 `.env` 파일을 만들고 Gemini API 키를 입력합니다.
 
-```env
-OPENAI_API_KEY=발급받은_OpenAI_API_키
+```bash
+# Windows
+copy .env.example .env
+# macOS / Linux
+cp .env.example .env
 ```
 
-`.env`와 Streamlit Secrets 파일은 `.gitignore`로 제외되며 GitHub에 올리지 않습니다.
+`.env` 내용:
 
-### 4.5 Streamlit 실행
-
-```powershell
-python -m streamlit run app.py
+```
+GOOGLE_API_KEY=발급받은_Gemini_키
 ```
 
-실행 후 브라우저에서 `http://localhost:8501`로 접속합니다.
+### 4. 실행
 
-## 5. 프로젝트 구조
-
-```text
-comento-AI-education-team/
-├── app.py                 # Streamlit 화면과 사용자 기능
-├── rag_module.py          # PDF 처리, 검색, 요약 및 답변 생성
-├── requirements.txt       # 실행에 필요한 Python 패키지
-├── .gitignore             # API 키, 가상환경, PDF 등 제외
-├── README.md
-└── docs/
-    └── architecture.md    # RAG 시스템 아키텍처와 운영 기준
+```bash
+streamlit run app.py
 ```
 
-## 6. 보안 및 운영 유의사항
+브라우저에서 `http://localhost:8501` 이 자동으로 열립니다.
 
-- OpenAI API 키는 코드나 GitHub 저장소에 직접 기록하지 않습니다.
-- 현재 로그인 계정은 MVP 시연용이며 실제 서비스에서는 별도의 인증 시스템으로 교체해야 합니다.
-- Streamlit Community Cloud의 로컬 저장소는 재시작 시 초기화될 수 있으므로, 운영 환경에서는 외부 데이터베이스 또는 오브젝트 스토리지 연동이 필요합니다.
-- 업로드한 PDF는 저작권과 개인정보 처리 기준을 확인한 자료만 사용해야 합니다.
+---
+
+## 테스트 계정
+
+| 역할 | 아이디 | 비밀번호 |
+|------|--------|----------|
+| 교수 | `professor` | `Prof-MVP-260822!` |
+| 학생 | `student` | `Student-MVP-260822!` |
+
+---
+
+## 사용 순서 (요약)
+
+1. 교수로 로그인 → PDF 강의자료 업로드·저장
+2. 각 자료의 학생 공개 설정을 켜기
+3. 질문하기 / 강의자료 요약으로 AI 답변 확인
+4. 학생으로 로그인 → 공개 자료 선택 → 질문·쉬운 설명·퀴즈 이용
+
+---
+
+## 참고
+
+- 업로드한 PDF·대화 기록은 실행 중인 서버의 로컬 저장소에 보관됩니다.
+- 강의자료 안에서 근거를 찾지 못한 질문에는 의도적으로 답을 지어내지 않습니다.

@@ -6,7 +6,17 @@ from pathlib import Path
 import pymupdf
 import streamlit as st
 
-from rag_module import process_pdfs_and_get_chain
+import security
+import storage
+from app_logging import get_logger, log_event, log_exception
+from rag_module import (
+    process_pdfs_and_get_chain,
+    prune_vector_cache as _prune_vector_cache_dir,
+)
+
+security.configure_api_keys()
+
+logger = get_logger()
 
 
 STUDENT_ANSWER_LANGUAGES = {
@@ -23,71 +33,54 @@ STUDENT_ANSWER_LANGUAGES = {
 }
 
 
-# =========================================================
-# 0. 기본 페이지 설정
-# =========================================================
-
 st.set_page_config(
     page_title="AI 학습지원 플랫폼",
     layout="wide"
 )
 
 
-# =========================================================
-# 1. Session State 초기화
-# =========================================================
-
-# 로그인 여부
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 
-# 사용자 역할
 if "role" not in st.session_state:
     st.session_state.role = None
 
-# 사용자 이름
 if "username" not in st.session_state:
     st.session_state.username = None
 
-# 현재 업로드한 PDF의 RAG
 if "rag_chain" not in st.session_state:
     st.session_state.rag_chain = None
 
-# 현재 RAG에 등록된 PDF 이름
 if "rag_filename" not in st.session_state:
     st.session_state.rag_filename = None
 
-# 마지막 AI 결과
 if "rag_result" not in st.session_state:
     st.session_state.rag_result = None
 
-# 현재 업로드한 PDF의 학생 공개 여부
 if "document_public" not in st.session_state:
     st.session_state.document_public = False
 
-# 현재 세션에서 생성한 파일별 RAG 객체 캐시
 if "rag_chains" not in st.session_state:
     st.session_state.rag_chains = {}
 
-# 현재 RAG에 연결된 PDF 선택 조합
+if "rag_chains_order" not in st.session_state:
+    st.session_state.rag_chains_order = []
+
 if "rag_selection" not in st.session_state:
     st.session_state.rag_selection = ()
 
-# 교수·학생 자료 패널 표시 여부
 if "professor_panel_visible" not in st.session_state:
     st.session_state.professor_panel_visible = True
 
 if "student_panel_visible" not in st.session_state:
     st.session_state.student_panel_visible = True
 
-# 교수·학생 대화 기록은 서로 분리해서 저장
 if "professor_chat_history" not in st.session_state:
     st.session_state.professor_chat_history = []
 
 if "student_chat_history" not in st.session_state:
     st.session_state.student_chat_history = []
 
-# 학생 퀴즈 풀이 상태
 if "student_quiz" not in st.session_state:
     st.session_state.student_quiz = []
 
@@ -107,54 +100,38 @@ if "chat_context_role" not in st.session_state:
     st.session_state.chat_context_role = None
 
 
-# =========================================================
-# 강의자료 저장소
-# =========================================================
-
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 PDF_DIR = DATA_DIR / "pdfs"
+VECTOR_CACHE_DIR = DATA_DIR / "vector_cache"
 DOCUMENTS_FILE = DATA_DIR / "documents.json"
 CHAT_SESSIONS_FILE = DATA_DIR / "chat_sessions.json"
+
+MAX_RAG_CHAINS_IN_MEMORY = 3
+
+MAX_CHAT_SESSIONS_PER_ROLE = 20
 
 
 def ensure_document_storage():
     PDF_DIR.mkdir(parents=True, exist_ok=True)
+    VECTOR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     if not DOCUMENTS_FILE.exists():
-        DOCUMENTS_FILE.write_text(
-            json.dumps(
-                {"documents": {}},
-                ensure_ascii=False,
-                indent=2
-            ),
-            encoding="utf-8"
-        )
+        storage.write_json(DOCUMENTS_FILE, {"documents": {}})
 
     if not CHAT_SESSIONS_FILE.exists():
-        CHAT_SESSIONS_FILE.write_text(
-            json.dumps(
-                {"users": {}},
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        storage.write_json(CHAT_SESSIONS_FILE, {"users": {}})
 
 
 def load_documents():
     ensure_document_storage()
 
-    try:
-        data = json.loads(
-            DOCUMENTS_FILE.read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError):
-        data = {"documents": {}}
-
+    data = storage.read_json(DOCUMENTS_FILE, {"documents": {}})
     documents = data.get("documents", {})
 
-    # 실제 PDF 파일이 존재하는 자료만 화면에 표시
+    if not isinstance(documents, dict):
+        documents = {}
+
     return {
         filename: metadata
         for filename, metadata in documents.items()
@@ -164,30 +141,14 @@ def load_documents():
 
 def save_documents(documents):
     ensure_document_storage()
-
-    temp_file = DOCUMENTS_FILE.with_suffix(".tmp")
-    temp_file.write_text(
-        json.dumps(
-            {"documents": documents},
-            ensure_ascii=False,
-            indent=2
-        ),
-        encoding="utf-8"
-    )
-    temp_file.replace(DOCUMENTS_FILE)
+    storage.write_json(DOCUMENTS_FILE, {"documents": documents})
 
 
 def load_saved_chat_sessions():
     """역할별 채팅 목록을 디스크에서 읽습니다."""
     ensure_document_storage()
 
-    try:
-        data = json.loads(
-            CHAT_SESSIONS_FILE.read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError):
-        data = {"users": {}}
-
+    data = storage.read_json(CHAT_SESSIONS_FILE, {"users": {}})
     users = data.get("users", {})
     return users if isinstance(users, dict) else {}
 
@@ -195,24 +156,23 @@ def load_saved_chat_sessions():
 def save_saved_chat_sessions(users):
     """역할별 채팅 목록을 임시 파일을 거쳐 안전하게 저장합니다."""
     ensure_document_storage()
-    temp_file = CHAT_SESSIONS_FILE.with_suffix(".tmp")
-    temp_file.write_text(
-        json.dumps(
-            {"users": users},
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    temp_file.replace(CHAT_SESSIONS_FILE)
+    storage.write_json(CHAT_SESSIONS_FILE, {"users": users})
 
 
 def save_uploaded_pdfs(uploaded_files):
-    documents = load_documents()
     saved_files = []
+    rejected_files = []
+    valid_uploads = []
 
     for uploaded_file in uploaded_files:
-        # 브라우저가 전달한 경로 부분은 제거하고 파일명만 사용
+        is_valid, error_message = security.validate_pdf_upload(
+            uploaded_file
+        )
+
+        if not is_valid:
+            rejected_files.append(error_message)
+            continue
+
         filename = Path(uploaded_file.name).name
 
         if not filename.lower().endswith(".pdf"):
@@ -221,16 +181,8 @@ def save_uploaded_pdfs(uploaded_files):
         (PDF_DIR / filename).write_bytes(
             uploaded_file.getvalue()
         )
+        valid_uploads.append((filename, uploaded_file.size))
 
-        # 같은 이름의 파일을 다시 올려도 기존 공개 설정은 유지
-        previous = documents.get(filename, {})
-        documents[filename] = {
-            "public": bool(previous.get("public", False)),
-            "size": uploaded_file.size
-        }
-
-        # 파일 내용이 바뀌었을 수 있으므로 이 파일이 포함된
-        # 모든 선택 조합의 RAG 캐시를 제거
         stale_keys = [
             cache_key
             for cache_key in st.session_state.rag_chains
@@ -242,7 +194,7 @@ def save_uploaded_pdfs(uploaded_files):
         ]
 
         for cache_key in stale_keys:
-            st.session_state.rag_chains.pop(cache_key, None)
+            _remove_rag_chain(cache_key)
 
         if filename in st.session_state.rag_selection:
             st.session_state.rag_chain = None
@@ -252,18 +204,40 @@ def save_uploaded_pdfs(uploaded_files):
 
         saved_files.append(filename)
 
-    save_documents(documents)
-    return saved_files
+    def _apply(data):
+        documents = data.get("documents", {})
+
+        if not isinstance(documents, dict):
+            documents = {}
+
+        for filename, size in valid_uploads:
+            previous = documents.get(filename, {})
+            documents[filename] = {
+                "public": bool(previous.get("public", False)),
+                "size": size,
+            }
+
+        data["documents"] = documents
+        return data
+
+    ensure_document_storage()
+    storage.update_json(DOCUMENTS_FILE, {"documents": {}}, _apply)
+    return saved_files, rejected_files
 
 
 def set_document_public(filename, is_public):
-    documents = load_documents()
+    def _apply(data):
+        documents = data.get("documents", {})
 
-    if filename not in documents:
-        return
+        if not isinstance(documents, dict) or filename not in documents:
+            return data
 
-    documents[filename]["public"] = bool(is_public)
-    save_documents(documents)
+        documents[filename]["public"] = bool(is_public)
+        data["documents"] = documents
+        return data
+
+    ensure_document_storage()
+    storage.update_json(DOCUMENTS_FILE, {"documents": {}}, _apply)
 
 
 def delete_document(filename):
@@ -283,8 +257,17 @@ def delete_document(filename):
     if pdf_path.is_file():
         pdf_path.unlink()
 
-    documents.pop(safe_filename, None)
-    save_documents(documents)
+    def _apply(data):
+        docs = data.get("documents", {})
+
+        if isinstance(docs, dict):
+            docs.pop(safe_filename, None)
+
+        data["documents"] = docs
+        return data
+
+    ensure_document_storage()
+    storage.update_json(DOCUMENTS_FILE, {"documents": {}}, _apply)
 
     stale_keys = [
         cache_key
@@ -297,7 +280,12 @@ def delete_document(filename):
     ]
 
     for cache_key in stale_keys:
-        st.session_state.rag_chains.pop(cache_key, None)
+        _remove_rag_chain(cache_key)
+
+    try:
+        prune_vector_cache()
+    except Exception as e:
+        log_exception("벡터 캐시 정리 실패", e)
 
     for selection_key in (
         "professor_selected_documents",
@@ -321,6 +309,68 @@ def delete_document(filename):
     st.session_state.pop("delete_document_target", None)
     st.session_state.pending_document_delete = None
     return True
+
+
+def _touch_rag_chain(selection):
+    """selection을 최근 사용 목록의 맨 뒤로 옮깁니다(LRU 갱신)."""
+    order = st.session_state.rag_chains_order
+
+    if selection in order:
+        order.remove(selection)
+
+    order.append(selection)
+
+
+def _remove_rag_chain(cache_key):
+    """RAG 체인 하나를 캐시와 LRU 순서 목록에서 함께 제거합니다."""
+    st.session_state.rag_chains.pop(cache_key, None)
+    order = st.session_state.rag_chains_order
+
+    if cache_key in order:
+        order.remove(cache_key)
+
+
+def prune_vector_cache():
+    """
+    디스크 벡터 캐시(data/vector_cache)의 폴더 수를 제한합니다.
+
+    캐시 폴더는 'PDF 조합'별 내용 해시라서 현재 PDF만으로 유효 해시 전체를
+    정확히 재현하긴 어렵습니다. 그래서 여기서는 개수 상한만 적용해
+    가장 오래된 캐시부터 정리합니다(정확도보다 저장공간 안정성 우선).
+    잘못 지워지더라도 다음 선택 시 자동으로 다시 임베딩되므로 안전합니다.
+    """
+    _prune_vector_cache_dir(
+        VECTOR_CACHE_DIR,
+        keep_hashes=None,
+        max_entries=20,
+    )
+
+
+def _evict_rag_chains_if_needed():
+    """
+    세션 메모리의 RAG 체인 수가 한도를 넘으면 가장 오래 전에 사용한 것부터
+    정리합니다. 현재 활성 selection은 정리 대상에서 제외합니다.
+    """
+    order = st.session_state.rag_chains_order
+    active = st.session_state.rag_selection
+
+    while len(st.session_state.rag_chains) > MAX_RAG_CHAINS_IN_MEMORY:
+        victim = None
+
+        for candidate in order:
+            if candidate != active and candidate in st.session_state.rag_chains:
+                victim = candidate
+                break
+
+        if victim is None:
+            break
+
+        st.session_state.rag_chains.pop(victim, None)
+
+        if victim in order:
+            order.remove(victim)
+
+        log_event(f"RAG 체인 메모리 정리(LRU): {', '.join(victim)}")
 
 
 def activate_documents(filenames):
@@ -350,11 +400,29 @@ def activate_documents(filenames):
                 + ", ".join(missing_files)
             )
 
-        st.session_state.rag_chains[selection] = (
-            process_pdfs_and_get_chain(
-                [str(path) for path in pdf_paths]
-            )
+        progress_placeholder = st.empty()
+        progress_bar = progress_placeholder.progress(
+            0,
+            text="PDF 임베딩 준비 중...",
         )
+
+        def _update_embedding_progress(done, total):
+            ratio = (done / total) if total else 1.0
+            progress_bar.progress(
+                min(max(ratio, 0.0), 1.0),
+                text=f"PDF 임베딩 처리 중... ({done}/{total} 청크)",
+            )
+
+        try:
+            st.session_state.rag_chains[selection] = (
+                process_pdfs_and_get_chain(
+                    [str(path) for path in pdf_paths],
+                    cache_dir=VECTOR_CACHE_DIR,
+                    progress_callback=_update_embedding_progress,
+                )
+            )
+        finally:
+            progress_placeholder.empty()
 
     if st.session_state.rag_selection != selection:
         st.session_state.rag_result = None
@@ -364,6 +432,9 @@ def activate_documents(filenames):
     )
     st.session_state.rag_selection = selection
     st.session_state.rag_filename = ", ".join(selection)
+
+    _touch_rag_chain(selection)
+    _evict_rag_chains_if_needed()
 
 
 @st.cache_data(show_spinner=False)
@@ -479,7 +550,6 @@ def display_student_source_excerpts(sources):
         metadata = documents.get(file_name)
         pdf_path = PDF_DIR / file_name
 
-        # 학생에게 공개된 실제 강의자료의 발췌만 표시
         if (
             metadata is None
             or not metadata.get("public", False)
@@ -604,12 +674,24 @@ def persist_role_chat_sessions(role):
     if sessions_key not in st.session_state:
         return
 
-    users = load_saved_chat_sessions()
-    users[chat_owner_key(role)] = {
+    owner_key = chat_owner_key(role)
+    payload = {
         "sessions": st.session_state[sessions_key],
         "active_id": st.session_state.get(active_key),
     }
-    save_saved_chat_sessions(users)
+
+    def _apply(data):
+        users = data.get("users", {})
+
+        if not isinstance(users, dict):
+            users = {}
+
+        users[owner_key] = payload
+        data["users"] = users
+        return data
+
+    ensure_document_storage()
+    storage.update_json(CHAT_SESSIONS_FILE, {"users": {}}, _apply)
 
 
 def load_chat_session(role, history_key, chat_id):
@@ -699,6 +781,36 @@ def sync_active_chat_session(role, history_key):
     persist_role_chat_sessions(role)
 
 
+def _prune_chat_sessions(role):
+    """
+    역할당 채팅방 수가 한도를 넘으면 오래된 채팅부터 정리합니다.
+    현재 활성 채팅은 정리 대상에서 제외합니다.
+    dict의 삽입 순서를 활용해 앞쪽(오래된)부터 제거합니다.
+    """
+    sessions_key, active_key = chat_session_keys(role)
+    sessions = st.session_state.get(sessions_key, {})
+    active_id = st.session_state.get(active_key)
+
+    if len(sessions) <= MAX_CHAT_SESSIONS_PER_ROLE:
+        return
+
+    removable_ids = [
+        chat_id
+        for chat_id in sessions
+        if chat_id != active_id
+    ]
+
+    remove_count = len(sessions) - MAX_CHAT_SESSIONS_PER_ROLE
+
+    for chat_id in removable_ids[:remove_count]:
+        sessions.pop(chat_id, None)
+
+    log_event(
+        f"오래된 채팅 정리: role={role}, "
+        f"{remove_count}개 제거"
+    )
+
+
 def start_new_chat(role, history_key):
     """현재 채팅을 보관하고 빈 채팅을 활성화합니다."""
     ensure_chat_sessions(role, history_key)
@@ -708,6 +820,9 @@ def start_new_chat(role, history_key):
     new_session = create_empty_chat_session(role)
     st.session_state[sessions_key][new_session["id"]] = new_session
     st.session_state[active_key] = new_session["id"]
+
+    _prune_chat_sessions(role)
+
     load_chat_session(role, history_key, new_session["id"])
 
 
@@ -786,6 +901,69 @@ def append_chat_history(history_key, user_message, result):
             ) or "새 채팅"
 
         sync_active_chat_session(role, history_key)
+
+
+def run_streaming_answer(
+    history_key,
+    display_user_message,
+    question_for_chain,
+    spinner_text,
+    answer_instruction="",
+):
+    """
+    RAGChain.stream()을 이용해 답변을 실시간으로 출력한 뒤,
+    완성된 답변을 대화 기록에 저장합니다.
+
+    - 검색(근거 확보)까지는 스피너를 보여주고,
+    - 이후 토큰이 흘러나오는 대로 st.write_stream으로 화면에 즉시 표시합니다.
+    - 근거가 없으면 경고 스타일로 출력합니다.
+
+    반환: 성공 여부(bool). 실패 시 오류 로그를 남기고 False를 반환합니다.
+    """
+    chain = st.session_state.rag_chain
+
+    try:
+        with st.spinner(spinner_text, show_time=True):
+            stream_gen, meta = chain.stream(
+                question_for_chain,
+                answer_instruction=answer_instruction,
+            )
+    except Exception as e:
+        log_exception("AI 스트리밍 준비 실패", e)
+        st.error(
+            "AI 답변 생성 중 오류가 발생했습니다. "
+            "잠시 후 다시 시도해주세요."
+        )
+        return False
+
+    has_evidence = meta.get("has_evidence", True)
+
+    try:
+        with st.chat_message("assistant"):
+            if has_evidence:
+                answer_text = st.write_stream(stream_gen)
+            else:
+                answer_text = "".join(stream_gen)
+                st.warning(answer_text)
+    except Exception as e:
+        log_exception("AI 스트리밍 출력 실패", e)
+        st.error(
+            "AI 답변 생성 중 오류가 발생했습니다. "
+            "잠시 후 다시 시도해주세요."
+        )
+        return False
+
+    result = {
+        "answer": answer_text,
+        "sources": meta.get("sources", []),
+        "has_evidence": has_evidence,
+    }
+    st.session_state.rag_result = result
+    st.session_state.student_excerpt_index = 0
+    append_chat_history(history_key, display_user_message, result)
+
+    st.rerun()
+    return True
 
 
 def display_chat_history(history_key, clear_button_key):
@@ -880,8 +1058,9 @@ def display_quiz_source_preview(file_name, page_number, toggle_key):
                 width="stretch",
             )
         except Exception as e:
+            log_exception("퀴즈 근거 페이지 렌더링 실패", e)
             st.warning(
-                f"근거 페이지를 표시하지 못했습니다: {e}"
+                "근거 페이지를 표시하지 못했습니다."
             )
 
 
@@ -1058,7 +1237,6 @@ def display_student_sources(sources):
     documents = load_documents()
     grouped_pages = {}
 
-    # 같은 PDF의 출처 페이지를 하나의 목록으로 묶습니다.
     for source in sources:
         if not isinstance(source, dict):
             continue
@@ -1072,7 +1250,6 @@ def display_student_sources(sources):
         metadata = documents.get(file_name)
         pdf_path = PDF_DIR / file_name
 
-        # 학생은 현재 공개 상태인 실제 저장 파일만 열 수 있음
         if (
             metadata is None
             or not metadata.get("public", False)
@@ -1161,8 +1338,9 @@ def display_student_sources(sources):
                     width="stretch"
                 )
             except Exception as e:
+                log_exception("출처 페이지 미리보기 렌더링 실패", e)
                 st.warning(
-                    f"페이지 미리보기를 표시하지 못했습니다: {e}"
+                    "페이지 미리보기를 표시하지 못했습니다."
                 )
 
 def display_student_downloads(file_names):
@@ -1212,31 +1390,25 @@ def display_student_downloads(file_names):
 ensure_document_storage()
 
 
-# =========================================================
-# 2. 임시 테스트 계정
-# =========================================================
-#
-# ⚠️ 개발 테스트용
-# 실제 서비스에서는 이런 식으로 비밀번호를 저장하면 안 됨.
-#
-
 TEST_USERS = {
     "professor": {
-        "password": "Prof-MVP-260822!",
+        "password_hash": (
+            "a0d8bd9fa838383cc80c302972681bc5"
+            "$fb432de65b608ae330d2b7a022a2ca2a1fc5455b963e821543015c7071988e13"
+        ),
         "role": "professor",
         "name": "김교수"
     },
     "student": {
-        "password": "Student-MVP-260822!",
+        "password_hash": (
+            "f3ffad544834970c324e795ae18a4607"
+            "$598a6e980bc815155529f2f68050a746e6e132d9accaea4faafdb3702d70bda6"
+        ),
         "role": "student",
         "name": "홍길동"
     }
 }
 
-
-# =========================================================
-# 3. 로그아웃 함수
-# =========================================================
 
 def logout():
     current_role = st.session_state.get("role")
@@ -1254,10 +1426,6 @@ def logout():
     st.rerun()
 
 
-# =========================================================
-# 4. 로그인 화면
-# =========================================================
-
 def show_login():
     st.title("🎓 AI 학습지원 플랫폼")
 
@@ -1268,13 +1436,11 @@ def show_login():
 
     st.divider()
 
-    # 화면을 가운데에 배치
     left, center, right = st.columns([1, 2, 1])
 
     with center:
         st.subheader("로그인")
 
-        # 입력값과 버튼 클릭을 한 번에 제출해 자동완성 동기화 문제 방지
         with st.form(
             "login_form",
             clear_on_submit=False,
@@ -1304,20 +1470,46 @@ def show_login():
             if submitted:
                 clean_id = (user_id or "").strip()
                 clean_password = (password or "").strip()
-                user = TEST_USERS.get(clean_id)
 
-                if (
-                    user is not None
-                    and clean_password == user["password"]
-                ):
-                    st.session_state.logged_in = True
-                    st.session_state.role = user["role"]
-                    st.session_state.username = user["name"]
-                    st.rerun()
-                else:
-                    st.error(
-                        "아이디 또는 비밀번호를 확인해주세요."
+                locked, remaining_seconds = security.check_lockout(
+                    clean_id
+                )
+
+                if locked:
+                    minutes = max(1, remaining_seconds // 60)
+                    log_event(
+                        f"잠금 상태 계정 로그인 시도: id={clean_id}",
+                        level="warning",
                     )
+                    st.error(
+                        "로그인 시도 횟수를 초과했습니다. "
+                        f"약 {minutes}분 후 다시 시도해주세요."
+                    )
+                else:
+                    user = TEST_USERS.get(clean_id)
+
+                    if (
+                        user is not None
+                        and security.verify_password(
+                            clean_password,
+                            user["password_hash"],
+                        )
+                    ):
+                        security.register_successful_login(clean_id)
+                        log_event(f"로그인 성공: id={clean_id}")
+                        st.session_state.logged_in = True
+                        st.session_state.role = user["role"]
+                        st.session_state.username = user["name"]
+                        st.rerun()
+                    else:
+                        security.register_failed_login(clean_id)
+                        log_event(
+                            f"로그인 실패: id={clean_id}",
+                            level="warning",
+                        )
+                        st.error(
+                            "아이디 또는 비밀번호를 확인해주세요."
+                        )
 
         st.info(
             "로그인 후 시스템이 계정 역할을 확인하여 "
@@ -1325,14 +1517,9 @@ def show_login():
         )
 
 
-# =========================================================
-# 5. 교수자 화면
-# =========================================================
-
 def show_professor_page():
     ensure_chat_sessions("professor", "professor_chat_history")
 
-    # ---------- 상단 ----------
     col1, col2 = st.columns([8, 2])
 
     with col1:
@@ -1389,9 +1576,6 @@ def show_professor_page():
         sidebar = None
         main = st.container()
 
-    # =====================================================
-    # 왼쪽 : 강의자료 관리
-    # =====================================================
     if sidebar is not None:
         with sidebar:
             display_chat_session_sidebar(
@@ -1421,19 +1605,30 @@ def show_professor_page():
             ):
                 try:
                     with st.spinner("PDF 파일을 저장하는 중입니다..."):
-                        saved_files = save_uploaded_pdfs(
-                            uploaded_files
+                        saved_files, rejected_files = (
+                            save_uploaded_pdfs(uploaded_files)
                         )
 
                     if saved_files:
                         st.success(
                             f"PDF {len(saved_files)}개를 저장했습니다."
                         )
-                    else:
+                        log_event(
+                            "PDF 저장 완료: "
+                            + ", ".join(saved_files)
+                        )
+
+                    if rejected_files:
+                        for reason in rejected_files:
+                            st.warning(reason)
+
+                    if not saved_files and not rejected_files:
                         st.warning("저장할 PDF가 없습니다.")
                 except Exception as e:
+                    log_exception("PDF 저장 실패", e)
                     st.error(
-                        f"PDF 저장 중 오류가 발생했습니다: {e}"
+                        "PDF 저장 중 오류가 발생했습니다. "
+                        "잠시 후 다시 시도해주세요."
                     )
 
             st.divider()
@@ -1475,6 +1670,7 @@ def show_professor_page():
                 if confirm_delete:
                     try:
                         if delete_document(pending_delete):
+                            log_event(f"강의자료 삭제: {pending_delete}")
                             st.session_state.document_action_message = (
                                 f"'{pending_delete}'을(를) 삭제했습니다."
                             )
@@ -1482,7 +1678,8 @@ def show_professor_page():
                         else:
                             st.warning("이미 삭제되었거나 찾을 수 없는 자료입니다.")
                     except OSError as error:
-                        st.error(f"PDF 삭제 중 오류가 발생했습니다: {error}")
+                        log_exception("PDF 삭제 실패", error)
+                        st.error("PDF 삭제 중 오류가 발생했습니다.")
 
                 if cancel_delete:
                     st.session_state.pending_document_delete = None
@@ -1547,9 +1744,6 @@ def show_professor_page():
             else:
                 st.caption("강의자료를 먼저 업로드해주세요.")
 
-    # =====================================================
-    # 중앙 : AI 기능
-    # =====================================================
     with main:
         st.subheader("🤖 AI 학습지원 챗봇")
 
@@ -1574,8 +1768,14 @@ def show_professor_page():
                         st.session_state.student_quiz_feedback = None
                 except Exception as e:
                     st.session_state.rag_chain = None
+                    log_exception(
+                        "교수 PDF 분석/임베딩 실패: "
+                        + ", ".join(selected_documents),
+                        e,
+                    )
                     st.error(
-                        f"PDF 분석 중 오류가 발생했습니다: {e}"
+                        "PDF 분석 중 오류가 발생했습니다. "
+                        "잠시 후 다시 시도해주세요."
                     )
         else:
             st.caption("현재 선택된 강의자료가 없습니다.")
@@ -1601,93 +1801,8 @@ def show_professor_page():
                 use_container_width=True
             )
 
-        with st.expander("🧪 검색 임계값 비교 (교수자용)"):
-            st.caption(
-                "동일한 질문에서 0.15, 0.25, 0.35를 비교합니다. "
-                "답변 생성 없이 검색 결과만 확인하므로 LLM 답변 토큰은 "
-                "사용하지 않습니다."
-            )
-            evaluation_question = st.text_input(
-                "평가 질문",
-                placeholder="예: V-M 선도의 의미와 작성 방법은?",
-                key="threshold_evaluation_question",
-            )
-            compare_button = st.button(
-                "세 임계값 비교",
-                use_container_width=True,
-                key="compare_retrieval_thresholds",
-            )
-
-            if compare_button:
-                if not selected_documents:
-                    st.warning("먼저 강의자료를 저장하고 선택해주세요.")
-                elif not evaluation_question.strip():
-                    st.warning("평가할 질문을 입력해주세요.")
-                elif st.session_state.rag_chain is None:
-                    st.warning("먼저 PDF 강의자료를 분석해주세요.")
-                else:
-                    try:
-                        comparison = (
-                            st.session_state.rag_chain
-                            .compare_retrieval_thresholds(
-                                evaluation_question
-                            )
-                        )
-
-                        if comparison["broad_summary"]:
-                            st.info(
-                                "이 질문은 전체 요약 요청으로 감지됩니다. "
-                                "현재 앱에서는 유사도 임계값을 거치지 않고 "
-                                "전용 요약 흐름으로 처리합니다."
-                            )
-                        else:
-                            rows = [
-                                {
-                                    "임계값": item["threshold"],
-                                    "통과 청크 수": item["matched_count"],
-                                    "최고 유사도": item["top_score"],
-                                }
-                                for item in comparison["comparisons"]
-                            ]
-                            st.dataframe(
-                                rows,
-                                use_container_width=True,
-                                hide_index=True,
-                            )
-                            st.caption(
-                                "핵심어 직접 일치 청크: "
-                                f"{comparison['keyword_hits']}개 "
-                                "(유사도 임계값과 별도로 보완되는 근거)"
-                            )
-
-                            for item in comparison["comparisons"]:
-                                st.markdown(
-                                    f"**임계값 {item['threshold']:.2f}의 "
-                                    "상위 근거**"
-                                )
-
-                                if not item["evidence"]:
-                                    st.write("통과한 의미 검색 근거가 없습니다.")
-                                    continue
-
-                                for evidence in item["evidence"]:
-                                    st.write(
-                                        f"- {evidence['file']} / "
-                                        f"{evidence['page']}페이지 / "
-                                        f"점수 {evidence['score']}: "
-                                        f"{evidence['excerpt']}"
-                                    )
-                    except Exception as error:
-                        st.error(
-                            "임계값 비교 중 오류가 발생했습니다: "
-                            f"{error}"
-                        )
-
         st.divider()
 
-        # =================================================
-        # AI 답변
-        # =================================================
         if ask_button:
             if not selected_documents:
                 st.warning("먼저 강의자료를 저장하고 선택해주세요.")
@@ -1696,23 +1811,23 @@ def show_professor_page():
             elif st.session_state.rag_chain is None:
                 st.warning("먼저 PDF 강의자료를 업로드해주세요.")
             else:
-                try:
-                    with st.spinner(
-                        "AI가 강의자료에서 답변을 찾는 중이에요...",
-                        show_time=True,
-                    ):
-                        result = st.session_state.rag_chain.invoke(
-                            question
-                        )
-                        st.session_state.rag_result = result
-                        append_chat_history(
-                            "professor_chat_history",
-                            question,
-                            result,
-                        )
-                except Exception as e:
-                    st.error(
-                        f"AI 답변 생성 중 오류가 발생했습니다: {e}"
+                allowed, remaining = security.try_consume_call(
+                    chat_owner_key("professor")
+                )
+
+                if not allowed:
+                    st.warning(
+                        "오늘의 AI 호출 한도를 모두 사용했습니다. "
+                        "내일 다시 시도해주세요."
+                    )
+                else:
+                    run_streaming_answer(
+                        "professor_chat_history",
+                        display_user_message=question,
+                        question_for_chain=question,
+                        spinner_text=(
+                            "AI가 강의자료에서 답변을 찾는 중이에요..."
+                        ),
                     )
 
         elif summary_button:
@@ -1721,33 +1836,42 @@ def show_professor_page():
             elif st.session_state.rag_chain is None:
                 st.warning("먼저 PDF 강의자료를 업로드해주세요.")
             else:
-                try:
-                    with st.spinner(
-                        "AI가 선택한 강의자료를 요약하는 중이에요...",
-                        show_time=True,
-                    ):
-                        result = (
-                            st.session_state.rag_chain.generate_summary()
-                        )
-                        st.session_state.rag_result = result
-                        append_chat_history(
-                            "professor_chat_history",
-                            "선택한 강의자료를 요약해줘",
-                            result,
-                        )
-                except Exception as e:
-                    st.error(
-                        f"강의자료 요약 중 오류가 발생했습니다: {e}"
+                allowed, remaining = security.try_consume_call(
+                    chat_owner_key("professor")
+                )
+
+                if not allowed:
+                    st.warning(
+                        "오늘의 AI 호출 한도를 모두 사용했습니다. "
+                        "내일 다시 시도해주세요."
                     )
+                else:
+                    try:
+                        with st.spinner(
+                            "AI가 선택한 강의자료를 요약하는 중이에요...",
+                            show_time=True,
+                        ):
+                            result = (
+                                st.session_state.rag_chain.generate_summary()
+                            )
+                            st.session_state.rag_result = result
+                            append_chat_history(
+                                "professor_chat_history",
+                                "선택한 강의자료를 요약해줘",
+                                result,
+                            )
+                    except Exception as e:
+                        log_exception("교수 강의자료 요약 실패", e)
+                        st.error(
+                            "강의자료 요약 중 오류가 발생했습니다. "
+                            "잠시 후 다시 시도해주세요."
+                        )
 
         display_chat_history(
             "professor_chat_history",
             "clear_professor_chat_history",
         )
 
-        # =================================================
-        # 출처 / 근거
-        # =================================================
         st.subheader("📖 출처 / 근거")
 
         if st.session_state.rag_result:
@@ -1772,14 +1896,9 @@ def show_professor_page():
             )
 
 
-# =========================================================
-# 6. 학생 화면
-# =========================================================
-
 def show_student_page():
     ensure_chat_sessions("student", "student_chat_history")
 
-    # ---------- 상단 ----------
     col1, col2 = st.columns([8, 2])
 
     with col1:
@@ -1840,9 +1959,6 @@ def show_student_page():
         sidebar = None
         main = st.container()
 
-    # =====================================================
-    # 왼쪽 : 허용된 강의자료
-    # =====================================================
     if sidebar is not None:
         with sidebar:
             display_chat_session_sidebar(
@@ -1879,9 +1995,6 @@ def show_student_page():
             st.write("**선택한 자료 다운로드**")
             display_student_downloads(selected_documents)
 
-    # =====================================================
-    # 중앙 : AI 학습 도우미
-    # =====================================================
     with main:
         st.subheader("🤖 AI 학습 도우미")
 
@@ -1911,8 +2024,14 @@ def show_student_page():
                         activate_documents(selected_documents)
                 except Exception as e:
                     st.session_state.rag_chain = None
+                    log_exception(
+                        "학생 PDF 분석/임베딩 실패: "
+                        + ", ".join(selected_documents),
+                        e,
+                    )
                     st.error(
-                        f"PDF 분석 중 오류가 발생했습니다: {e}"
+                        "PDF 분석 중 오류가 발생했습니다. "
+                        "잠시 후 다시 시도해주세요."
                     )
         else:
             st.caption("현재 선택된 강의자료가 없습니다.")
@@ -1957,25 +2076,24 @@ def show_student_page():
             elif st.session_state.rag_chain is None:
                 st.warning("먼저 PDF 강의자료를 업로드해주세요.")
             else:
-                try:
-                    with st.spinner(
-                        "AI가 강의자료에서 답변을 찾는 중이에요...",
-                        show_time=True,
-                    ):
-                        result = st.session_state.rag_chain.invoke(
-                            question,
-                            answer_instruction=answer_instruction,
-                        )
-                        st.session_state.rag_result = result
-                        st.session_state.student_excerpt_index = 0
-                        append_chat_history(
-                            "student_chat_history",
-                            question,
-                            result,
-                        )
-                except Exception as e:
-                    st.error(
-                        f"AI 답변 생성 중 오류가 발생했습니다: {e}"
+                allowed, remaining = security.try_consume_call(
+                    chat_owner_key("student")
+                )
+
+                if not allowed:
+                    st.warning(
+                        "오늘의 AI 호출 한도를 모두 사용했습니다. "
+                        "내일 다시 시도해주세요."
+                    )
+                else:
+                    run_streaming_answer(
+                        "student_chat_history",
+                        display_user_message=question,
+                        question_for_chain=question,
+                        spinner_text=(
+                            "AI가 강의자료에서 답변을 찾는 중이에요..."
+                        ),
+                        answer_instruction=answer_instruction,
                     )
 
         elif explain_button:
@@ -1986,27 +2104,28 @@ def show_student_page():
             elif st.session_state.rag_chain is None:
                 st.warning("먼저 PDF 강의자료를 업로드해주세요.")
             else:
-                try:
-                    with st.spinner(
-                        "AI가 내용을 더 쉽게 정리하는 중이에요...",
-                        show_time=True,
-                    ):
-                        result = st.session_state.rag_chain.invoke(
+                allowed, remaining = security.try_consume_call(
+                    chat_owner_key("student")
+                )
+
+                if not allowed:
+                    st.warning(
+                        "오늘의 AI 호출 한도를 모두 사용했습니다. "
+                        "내일 다시 시도해주세요."
+                    )
+                else:
+                    run_streaming_answer(
+                        "student_chat_history",
+                        display_user_message=f"더 쉽게 설명해줘: {question}",
+                        question_for_chain=(
                             "다음 질문에 대해 학생이 이해하기 쉽도록 "
                             "쉬운 표현과 구체적인 예시를 사용해서 설명해주세요.\n\n"
-                            f"질문: {question}",
-                            answer_instruction=answer_instruction,
-                        )
-                        st.session_state.rag_result = result
-                        st.session_state.student_excerpt_index = 0
-                        append_chat_history(
-                            "student_chat_history",
-                            f"더 쉽게 설명해줘: {question}",
-                            result,
-                        )
-                except Exception as e:
-                    st.error(
-                        f"AI 답변 생성 중 오류가 발생했습니다: {e}"
+                            f"질문: {question}"
+                        ),
+                        spinner_text=(
+                            "AI가 내용을 더 쉽게 정리하는 중이에요..."
+                        ),
+                        answer_instruction=answer_instruction,
                     )
 
         elif quiz_button:
@@ -2015,38 +2134,50 @@ def show_student_page():
             elif st.session_state.rag_chain is None:
                 st.warning("먼저 강의자료를 선택해주세요.")
             else:
-                try:
-                    with st.spinner(
-                        "AI가 풀 수 있는 퀴즈를 만드는 중이에요...",
-                        show_time=True,
-                    ):
-                        result = (
-                            st.session_state.rag_chain.generate_quiz()
-                        )
-                        quiz = result.get("quiz", [])
+                allowed, remaining = security.try_consume_call(
+                    chat_owner_key("student")
+                )
 
-                        if not quiz:
-                            st.warning(
-                                "퀴즈 문항을 만들지 못했습니다. "
-                                "다시 시도해주세요."
-                            )
-                        else:
-                            st.session_state.student_quiz = quiz
-                            st.session_state.student_quiz_feedback = None
-                            st.session_state.student_quiz_version += 1
-                            st.session_state.rag_result = {
-                                "answer": "복습 퀴즈 6문항을 만들었습니다.",
-                                "sources": result.get("sources", []),
-                                "has_evidence": True,
-                            }
-                            sync_active_chat_session(
-                                "student",
-                                "student_chat_history",
-                            )
-                except Exception as e:
-                    st.error(
-                        f"퀴즈 생성 중 오류가 발생했습니다: {e}"
+                if not allowed:
+                    st.warning(
+                        "오늘의 AI 호출 한도를 모두 사용했습니다. "
+                        "내일 다시 시도해주세요."
                     )
+                else:
+                    try:
+                        with st.spinner(
+                            "AI가 풀 수 있는 퀴즈를 만드는 중이에요...",
+                            show_time=True,
+                        ):
+                            result = (
+                                st.session_state.rag_chain.generate_quiz()
+                            )
+                            quiz = result.get("quiz", [])
+
+                            if not quiz:
+                                st.warning(
+                                    "퀴즈 문항을 만들지 못했습니다. "
+                                    "다시 시도해주세요."
+                                )
+                            else:
+                                st.session_state.student_quiz = quiz
+                                st.session_state.student_quiz_feedback = None
+                                st.session_state.student_quiz_version += 1
+                                st.session_state.rag_result = {
+                                    "answer": "복습 퀴즈 6문항을 만들었습니다.",
+                                    "sources": result.get("sources", []),
+                                    "has_evidence": True,
+                                }
+                                sync_active_chat_session(
+                                    "student",
+                                    "student_chat_history",
+                                )
+                    except Exception as e:
+                        log_exception("학생 퀴즈 생성 실패", e)
+                        st.error(
+                            "퀴즈 생성 중 오류가 발생했습니다. "
+                            "잠시 후 다시 시도해주세요."
+                        )
 
         display_student_quiz()
 
@@ -2079,9 +2210,6 @@ def show_student_page():
                 "질문에 답변하면 근거가 여기에 표시됩니다."
             )
 
-# =========================================================
-# 7. 페이지 분기
-# =========================================================
 
 if not st.session_state.logged_in:
     show_login()

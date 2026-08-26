@@ -1,5 +1,8 @@
+import hashlib
+import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -8,12 +11,85 @@ import pymupdf as fitz
 from pydantic import BaseModel, Field
 
 from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_google_genai import (
+    ChatGoogleGenerativeAI,
+    GoogleGenerativeAIEmbeddings,
+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 
 load_dotenv()
+
+logger = logging.getLogger("ai_learning_platform")
+
+CHAT_MODEL = "gemini-3.6-flash"
+EMBEDDING_MODEL = "models/gemini-embedding-001"
+
+RELEVANCE_THRESHOLD = 0.55
+
+
+def get_embeddings():
+    """Gemini 임베딩 객체를 생성합니다. (GOOGLE_API_KEY 환경변수 사용)"""
+    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+
+
+def content_to_text(content) -> str:
+    """
+    LLM 응답의 content를 사람이 읽을 깔끔한 문자열로 변환합니다.
+
+    OpenAI는 content가 항상 문자열이지만, Gemini(langchain-google-genai)는
+    경우에 따라 리스트(예: [{'type': 'text', 'text': '...'}]) 형태로 돌려줍니다.
+    이 함수는 문자열/리스트/딕셔너리 어떤 형태가 와도 텍스트만 이어붙여 반환해,
+    화면에 '[{...}]' 같은 원본 구조가 그대로 노출되는 문제를 방지합니다.
+    """
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            else:
+                text_attr = getattr(item, "text", None)
+                if isinstance(text_attr, str):
+                    parts.append(text_attr)
+        return "".join(parts)
+
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return text
+
+    return str(content)
+
+EMBEDDING_BATCH_SIZE = 100
+EMBEDDING_MAX_RETRIES = 3
+EMBEDDING_RETRY_BASE_DELAY = 2
+
+CHUNK_SIZE = 700
+CHUNK_OVERLAP = 120
+
+CHUNK_SEPARATORS = [
+    "\n\n",
+    "\n",
+    ". ",
+    "? ",
+    "! ",
+    "다. ",
+    "요. ",
+    "。",
+    " ",
+    "",
+]
 
 
 class QuizQuestion(BaseModel):
@@ -33,9 +109,6 @@ class QuizSet(BaseModel):
     )
 
 
-# =========================================================
-# 1. PDF를 페이지별 Document로 읽기
-# =========================================================
 def load_pdf_documents(pdf_path: str):
     """
     PDF의 각 페이지를 Document로 변환합니다.
@@ -68,41 +141,197 @@ def load_pdf_documents(pdf_path: str):
     return documents
 
 
-# =========================================================
-# 2. 페이지를 청크로 분할
-# =========================================================
 def split_documents(documents):
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=400,
-        chunk_overlap=50,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=CHUNK_SEPARATORS,
+        keep_separator=True,
     )
 
-    # split_documents를 사용하면 원본 metadata가 청크에도 유지됩니다.
-    return splitter.split_documents(documents)
+    chunks = splitter.split_documents(documents)
+
+    return [
+        chunk
+        for chunk in chunks
+        if chunk.page_content and chunk.page_content.strip()
+    ]
 
 
-# =========================================================
-# 3. 임베딩 + FAISS
-# =========================================================
-def build_vectorstore(chunks):
+def _call_with_retry(func, *args, **kwargs):
+    """
+    임베딩 API 호출용 재시도 헬퍼.
+    rate limit, 일시적 네트워크 오류 등에 대비해
+    지수 백오프(2초 → 4초 → 8초)로 최대 3회 재시도합니다.
+    """
+    last_error = None
+
+    for attempt in range(1, EMBEDDING_MAX_RETRIES + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as error:
+            last_error = error
+
+            if attempt >= EMBEDDING_MAX_RETRIES:
+                break
+
+            delay = EMBEDDING_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.warning(
+                "임베딩 API 호출 실패 (시도 %d/%d), %d초 후 재시도: %s",
+                attempt,
+                EMBEDDING_MAX_RETRIES,
+                delay,
+                error,
+            )
+            time.sleep(delay)
+
+    logger.error(
+        "임베딩 API 호출 최종 실패 (%d회 시도): %s",
+        EMBEDDING_MAX_RETRIES,
+        last_error,
+    )
+    raise RuntimeError(
+        f"임베딩 API 호출에 {EMBEDDING_MAX_RETRIES}회 실패했습니다: "
+        f"{last_error}"
+    ) from last_error
+
+
+def build_vectorstore(chunks, progress_callback=None):
+    """
+    청크를 배치 단위로 나누어 임베딩합니다.
+
+    - 배치마다 재시도 로직을 적용해 일시적 API 오류에 견고합니다.
+    - progress_callback(done, total)을 배치가 끝날 때마다 호출해서
+      대용량 PDF 처리 중에도 진행 상황을 화면에 표시할 수 있습니다.
+    """
     if not chunks:
         raise ValueError(
             "PDF에서 읽을 수 있는 텍스트를 찾지 못했습니다."
         )
 
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small"
+    embeddings = get_embeddings()
+
+    total = len(chunks)
+    vectorstore = None
+
+    for start in range(0, total, EMBEDDING_BATCH_SIZE):
+        batch = chunks[start:start + EMBEDDING_BATCH_SIZE]
+
+        if vectorstore is None:
+            vectorstore = _call_with_retry(
+                FAISS.from_documents,
+                batch,
+                embedding=embeddings,
+            )
+        else:
+            _call_with_retry(
+                vectorstore.add_documents,
+                batch,
+            )
+
+        done = min(start + EMBEDDING_BATCH_SIZE, total)
+
+        if progress_callback is not None:
+            progress_callback(done, total)
+
+    return vectorstore
+
+
+def compute_content_hash(pdf_paths) -> str:
+    """
+    선택한 PDF들의 실제 내용을 기준으로 캐시 키를 만듭니다.
+    파일명이 아니라 내용(바이트) 해시라서, 같은 이름이라도 내용이
+    바뀌면 자동으로 다른 캐시 키가 되어 새로 임베딩합니다.
+
+    청킹/임베딩 설정도 키에 포함합니다. 청크 크기 등 설정이 바뀌면
+    이전 인덱스와 호환되지 않으므로, 자동으로 다른 키가 되어
+    새 인덱스를 만들도록 합니다.
+    """
+    hasher = hashlib.sha256()
+
+    config_signature = (
+        f"cs={CHUNK_SIZE};co={CHUNK_OVERLAP};"
+        f"sep={len(CHUNK_SEPARATORS)};emb={EMBEDDING_MODEL}"
     )
+    hasher.update(config_signature.encode("utf-8"))
 
-    return FAISS.from_documents(
-        chunks,
-        embedding=embeddings,
-    )
+    for pdf_path in sorted(pdf_paths, key=lambda p: Path(p).name):
+        file_bytes = Path(pdf_path).read_bytes()
+        hasher.update(Path(pdf_path).name.encode("utf-8"))
+        hasher.update(hashlib.sha256(file_bytes).digest())
+
+    return hasher.hexdigest()[:24]
 
 
-# =========================================================
-# 4. 프롬프트
-# =========================================================
+def load_cached_vectorstore(cache_dir, content_hash, embeddings):
+    """디스크에 저장된 FAISS 인덱스가 있으면 불러오고, 없거나 손상되었으면 None."""
+    cache_path = Path(cache_dir) / content_hash
+
+    if not cache_path.exists():
+        return None
+
+    try:
+        return FAISS.load_local(
+            str(cache_path),
+            embeddings,
+            allow_dangerous_deserialization=True,
+        )
+    except Exception:
+        return None
+
+
+def save_vectorstore_cache(vectorstore, cache_dir, content_hash):
+    """FAISS 인덱스를 디스크에 저장합니다. 실패해도 앱 동작에는 영향 없음(best-effort)."""
+    cache_path = Path(cache_dir) / content_hash
+    cache_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        vectorstore.save_local(str(cache_path))
+    except Exception:
+        pass
+
+
+def prune_vector_cache(cache_dir, keep_hashes=None, max_entries=20):
+    """
+    디스크 벡터 캐시 폴더를 정리합니다.
+
+    - keep_hashes(집합)가 주어지면, 그 목록에 없는 폴더를 우선 삭제합니다.
+      (예: 현재 존재하는 PDF들로 만들 수 있는 유효한 캐시 해시 집합)
+    - 그 후에도 폴더 수가 max_entries를 넘으면, 가장 오래된(수정시각 기준)
+      폴더부터 삭제해 개수를 제한합니다.
+
+    best-effort로 동작하며, 개별 삭제 실패는 무시합니다.
+    """
+    import shutil
+
+    cache_dir = Path(cache_dir)
+
+    if not cache_dir.exists():
+        return
+
+    entries = [p for p in cache_dir.iterdir() if p.is_dir()]
+
+    if keep_hashes is not None:
+        keep = set(keep_hashes)
+        for entry in list(entries):
+            if entry.name not in keep:
+                try:
+                    shutil.rmtree(entry, ignore_errors=True)
+                except OSError:
+                    pass
+
+        entries = [p for p in cache_dir.iterdir() if p.is_dir()]
+
+    if len(entries) > max_entries:
+        entries.sort(key=lambda p: p.stat().st_mtime)
+
+        for entry in entries[:len(entries) - max_entries]:
+            try:
+                shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                pass
+
+
 PROMPT = """
 # 역할
 당신은 강의자료를 기반으로 답변하는 AI 학습지원 도우미입니다.
@@ -126,7 +355,9 @@ PROMPT = """
    - **물리적 의미**: 값이 커지거나 작아질 때 무엇을 의미하는지 설명
    - **쉽게 이해하기**: 강의자료에서 뒷받침되는 직관적 설명
    - **핵심 정리**: 시험 전에 기억할 내용을 2~3개 항목으로 정리
-3. 공식은 가능한 경우 Markdown 수식 표기법을 사용하세요.
+3. 공식은 LaTeX나 수식 기호($, \\frac 등) 없이, 한 줄로 읽을 수 있는 일반 텍스트로 쓰세요.
+   예: "Z = I / c", "sigma = P / A", "ΔU = Q - W" 처럼 표기하세요.
+   분수는 슬래시(/)로, 제곱은 h^2 또는 h²처럼 표기하세요.
 4. 강의자료에 없는 예시, 수치 또는 적용 사례는 만들어내지 마세요.
 5. 질문에 따라 해당되지 않는 항목은 억지로 작성하지 말고 생략하세요.
 6. 답변은 충분히 설명하되 불필요하게 반복하지 마세요.
@@ -180,6 +411,8 @@ SUMMARY_PROMPT = """
 5. 중요한 설명마다 근거 파일명과 페이지를 표시하세요.
 6. 근거에서 확인되지 않는 항목은 억지로 작성하지 말고 생략하세요.
 7. 한국어로 작성하세요.
+8. 공식은 LaTeX나 수식 기호($, \\frac 등) 없이 한 줄 일반 텍스트로 쓰세요.
+   예: "Z = I / c", "ΔU = Q - W", "I = b × h^3 / 12" 처럼 표기하세요.
 
 # 출력 형식
 # 강의자료 핵심 요약
@@ -213,9 +446,6 @@ def get_summary_prompt():
     return ChatPromptTemplate.from_template(SUMMARY_PROMPT)
 
 
-# =========================================================
-# 5. 짧은 질문용 핵심어 추출
-# =========================================================
 def extract_search_keywords(question: str):
     tokens = re.findall(
         r"[가-힣A-Za-z0-9]+",
@@ -301,22 +531,17 @@ def is_broad_summary_request(question: str):
     ):
         return False
 
-    # 요약 표현을 제외한 실제 주제어가 남으면 일반 질의로 처리합니다.
-    # 예: "단면계수를 요약해줘"는 단면계수 검색을 수행합니다.
     return not extract_search_keywords(normalized_question)
 
 
-# =========================================================
-# 6. 실제 RAG 객체
-# =========================================================
 class RAGChain:
     def __init__(self, vectorstore, filename, chunks):
         self.vectorstore = vectorstore
         self.filename = filename
         self.chunks = chunks
 
-        self.llm = ChatOpenAI(
-            model="gpt-4o",
+        self.llm = ChatGoogleGenerativeAI(
+            model=CHAT_MODEL,
             temperature=0,
         )
 
@@ -324,102 +549,6 @@ class RAGChain:
         self.quiz_prompt = get_quiz_prompt()
         self.summary_prompt = get_summary_prompt()
         self.quiz_llm = self.llm.with_structured_output(QuizSet)
-
-    def compare_retrieval_thresholds(
-        self,
-        question: str,
-        thresholds=(0.15, 0.25, 0.35),
-        k: int = 8,
-    ):
-        """같은 검색 결과를 여러 유사도 임계값으로 비교합니다.
-
-        답변 생성 모델은 호출하지 않고 검색 결과만 비교하므로,
-        임계값 조정 전 평가용으로 사용할 수 있습니다.
-        """
-        normalized_question = question.strip()
-
-        if not normalized_question:
-            raise ValueError("비교할 질문을 입력해주세요.")
-
-        if is_broad_summary_request(normalized_question):
-            return {
-                "broad_summary": True,
-                "question": normalized_question,
-                "comparisons": [],
-                "keyword_hits": 0,
-            }
-
-        normalized_thresholds = sorted({
-            float(threshold)
-            for threshold in thresholds
-            if 0.0 <= float(threshold) <= 1.0
-        })
-
-        if not normalized_thresholds:
-            raise ValueError("0과 1 사이의 임계값이 필요합니다.")
-
-        results = (
-            self.vectorstore
-            .similarity_search_with_relevance_scores(
-                normalized_question,
-                k=k,
-            )
-        )
-        results = sorted(
-            results,
-            key=lambda item: float(item[1]),
-            reverse=True,
-        )
-
-        keywords = extract_search_keywords(normalized_question)
-        keyword_hits = 0
-
-        if keywords:
-            keyword_hits = sum(
-                1
-                for doc in self.chunks
-                if any(
-                    keyword in doc.page_content.lower()
-                    for keyword in keywords
-                )
-            )
-
-        comparisons = []
-
-        for threshold in normalized_thresholds:
-            matched_results = [
-                (doc, score)
-                for doc, score in results
-                if float(score) >= threshold
-            ]
-            evidence = []
-
-            for doc, score in matched_results[:3]:
-                excerpt = " ".join(doc.page_content.split())
-                evidence.append({
-                    "file": doc.metadata.get("source", self.filename),
-                    "page": doc.metadata.get("page", "?"),
-                    "score": round(float(score), 3),
-                    "excerpt": excerpt[:180],
-                })
-
-            comparisons.append({
-                "threshold": threshold,
-                "matched_count": len(matched_results),
-                "top_score": (
-                    round(float(results[0][1]), 3)
-                    if results
-                    else None
-                ),
-                "evidence": evidence,
-            })
-
-        return {
-            "broad_summary": False,
-            "question": normalized_question,
-            "comparisons": comparisons,
-            "keyword_hits": keyword_hits,
-        }
 
     def generate_summary(self):
         """선택한 강의자료를 파일별 복습 노트 형태로 요약합니다."""
@@ -442,8 +571,6 @@ class RAGChain:
                 filter={"source": source_name},
             )
 
-            # 자료의 앞부분에만 치우치지 않도록 전체 구간에서
-            # 대표 청크도 함께 선택합니다.
             if source_chunks:
                 positions = {
                     0,
@@ -512,7 +639,7 @@ class RAGChain:
                 })
 
         return {
-            "answer": response.content,
+            "answer": content_to_text(response.content),
             "sources": sources,
             "has_evidence": True,
         }
@@ -527,8 +654,6 @@ class RAGChain:
         quiz_documents = []
         search_query = "핵심 개념 정의 원리 공식 특징 학습 목표"
 
-        # 일반 질문의 점수 기준을 적용하지 않고, 선택한 각 파일에서
-        # 퀴즈에 쓸 대표 근거를 따로 가져옵니다.
         for source_name in source_names:
             documents = self.vectorstore.similarity_search(
                 search_query,
@@ -536,8 +661,6 @@ class RAGChain:
                 filter={"source": source_name},
             )
 
-            # 벡터 저장소 버전에 따라 필터 결과가 없을 때를 대비한
-            # 안전한 대체 선택입니다.
             if not documents:
                 source_chunks = [
                     doc for doc in self.chunks
@@ -653,6 +776,170 @@ class RAGChain:
             "has_evidence": True,
         }
 
+    def _retrieve_context(self, question: str):
+        """
+        질문에 대한 근거 청크를 검색해 Context 문자열과 출처 목록을 만듭니다.
+        invoke()와 stream()이 공유하는 검색 로직입니다.
+
+        반환:
+        - relevant_results가 비어 있으면 (None, None) — 근거 부족
+        - 그렇지 않으면 (context 문자열, sources 리스트)
+        """
+        results = (
+            self.vectorstore
+            .similarity_search_with_relevance_scores(
+                question,
+                k=8,
+            )
+        )
+
+        threshold = RELEVANCE_THRESHOLD
+
+        relevant_results = [
+            (doc, score)
+            for doc, score in results
+            if score >= threshold
+        ]
+
+        keywords = extract_search_keywords(question)
+
+        if keywords:
+            existing_chunks = {
+                (
+                    doc.metadata.get("source"),
+                    doc.metadata.get("page"),
+                    doc.page_content,
+                )
+                for doc, score in relevant_results
+            }
+
+            for doc in self.chunks:
+                content = doc.page_content.lower()
+
+                if not any(keyword in content for keyword in keywords):
+                    continue
+
+                chunk_key = (
+                    doc.metadata.get("source"),
+                    doc.metadata.get("page"),
+                    doc.page_content,
+                )
+
+                if chunk_key not in existing_chunks:
+                    relevant_results.append((doc, 1.0))
+                    existing_chunks.add(chunk_key)
+
+                if len(relevant_results) >= 8:
+                    break
+
+        if not relevant_results:
+            return None, None
+
+        context_parts = []
+
+        for doc, score in relevant_results:
+            source = doc.metadata.get("source", self.filename)
+            page = doc.metadata.get("page", "?")
+            context_parts.append(
+                f"[출처: {source}, 페이지: {page}]\n"
+                f"{doc.page_content}"
+            )
+
+        context = "\n\n".join(context_parts)
+
+        sources = []
+        seen = set()
+
+        for doc, score in relevant_results:
+            source = doc.metadata.get("source", self.filename)
+            page = doc.metadata.get("page", "?")
+            key = (source, page)
+
+            if key not in seen:
+                seen.add(key)
+                sources.append({
+                    "file": source,
+                    "page": page,
+                    "score": round(float(score), 3),
+                    "excerpt": doc.page_content.strip(),
+                })
+
+        return context, sources
+
+    def _build_prompt_messages(self, question, context, answer_instruction=""):
+        """LLM에 보낼 메시지를 구성합니다."""
+        prompt_question = question
+
+        if answer_instruction.strip():
+            prompt_question = (
+                f"{question}\n\n"
+                "[답변 작성 언어 지침]\n"
+                f"{answer_instruction.strip()}"
+            )
+
+        return self.prompt.format_messages(
+            context=context,
+            question=prompt_question,
+        )
+
+    def stream(self, question: str, answer_instruction: str = ""):
+        """
+        답변을 토큰 단위로 스트리밍하는 제너레이터를 돌려줍니다.
+
+        사용법 (app.py):
+            stream_gen, meta = chain.stream(question)
+            answer_text = st.write_stream(stream_gen)   # 실시간 출력
+            # 이후 meta["sources"], meta["has_evidence"]로 마무리 처리
+
+        반환: (generator, meta_dict)
+        - meta_dict["has_evidence"]가 False면 generator는 근거 부족 메시지를
+          한 번에 내보내고, sources는 빈 리스트입니다.
+        - LLM 스트리밍 중 오류가 나면 generator가 예외를 발생시키므로
+          호출부에서 try/except로 감싸야 합니다.
+        """
+        if is_broad_summary_request(question):
+            result = self.generate_summary()
+
+            def _summary_gen():
+                yield result.get("answer", "")
+
+            return _summary_gen(), {
+                "sources": result.get("sources", []),
+                "has_evidence": result.get("has_evidence", True),
+            }
+
+        context, sources = self._retrieve_context(question)
+
+        if context is None:
+            no_evidence_message = (
+                "선택한 강의자료에서 충분한 근거를 찾지 못했습니다."
+            )
+
+            def _no_evidence_gen():
+                yield no_evidence_message
+
+            return _no_evidence_gen(), {
+                "sources": [],
+                "has_evidence": False,
+            }
+
+        messages = self._build_prompt_messages(
+            question,
+            context,
+            answer_instruction,
+        )
+
+        def _token_gen():
+            for chunk in self.llm.stream(messages):
+                text = content_to_text(getattr(chunk, "content", ""))
+                if text:
+                    yield text
+
+        return _token_gen(), {
+            "sources": sources,
+            "has_evidence": True,
+        }
+
     def invoke(
         self,
         question: str,
@@ -670,80 +957,12 @@ class RAGChain:
         }
         """
 
-        # "전체를 요약해줘"처럼 특정 검색어가 없는 요청은
-        # 유사도 검색 기준을 적용하지 않고 파일별 대표 내용을
-        # 고르게 선택하는 전용 요약 흐름으로 보냅니다.
         if is_broad_summary_request(question):
             return self.generate_summary()
 
-        # ---------------------------------------------
-        # 검색 + 유사도 점수
-        # ---------------------------------------------
-        results = (
-            self.vectorstore
-            .similarity_search_with_relevance_scores(
-                question,
-                k=8,
-            )
-        )
+        context, sources = self._retrieve_context(question)
 
-        # ---------------------------------------------
-        # 근거 부족 검사
-        # ---------------------------------------------
-        #
-        # 주의:
-        # 의미검색 점수가 낮더라도 PDF에 질문 핵심어가 직접
-        # 등장하면 아래 핵심어 검색에서 근거로 다시 포함합니다.
-        # 실제 PDF/질문 세트로 테스트 후 조정해야 합니다.
-        #
-        threshold = 0.15
-
-        relevant_results = [
-            (doc, score)
-            for doc, score in results
-            if score >= threshold
-        ]
-
-        # ---------------------------------------------
-        # 짧은 질문용 핵심어 직접 검색
-        # ---------------------------------------------
-        # 예: "단면계수가 뭐야" → "단면계수"
-        keywords = extract_search_keywords(question)
-
-        if keywords:
-            existing_chunks = {
-                (
-                    doc.metadata.get("source"),
-                    doc.metadata.get("page"),
-                    doc.page_content,
-                )
-                for doc, score in relevant_results
-            }
-
-            for doc in self.chunks:
-                content = doc.page_content.lower()
-
-                if not any(
-                    keyword in content
-                    for keyword in keywords
-                ):
-                    continue
-
-                chunk_key = (
-                    doc.metadata.get("source"),
-                    doc.metadata.get("page"),
-                    doc.page_content,
-                )
-
-                if chunk_key not in existing_chunks:
-                    # 직접 일치한 근거임을 나타내는 내부 점수
-                    relevant_results.append((doc, 1.0))
-                    existing_chunks.add(chunk_key)
-
-                if len(relevant_results) >= 8:
-                    break
-
-        if not relevant_results:
+        if context is None:
             return {
                 "answer": (
                     "선택한 강의자료에서 충분한 "
@@ -753,72 +972,14 @@ class RAGChain:
                 "has_evidence": False,
             }
 
-        # ---------------------------------------------
-        # 검색된 문서를 Context로 구성
-        # ---------------------------------------------
-        context_parts = []
-
-        for doc, score in relevant_results:
-            source = doc.metadata.get(
-                "source",
-                self.filename,
-            )
-            page = doc.metadata.get("page", "?")
-
-            context_parts.append(
-                f"[출처: {source}, 페이지: {page}]\n"
-                f"{doc.page_content}"
-            )
-
-        context = "\n\n".join(context_parts)
-
-        # ---------------------------------------------
-        # LLM 호출
-        # ---------------------------------------------
-        prompt_question = question
-
-        if answer_instruction.strip():
-            prompt_question = (
-                f"{question}\n\n"
-                "[답변 작성 언어 지침]\n"
-                f"{answer_instruction.strip()}"
-            )
-
-        messages = self.prompt.format_messages(
-            context=context,
-            question=prompt_question,
+        messages = self._build_prompt_messages(
+            question,
+            context,
+            answer_instruction,
         )
 
         response = self.llm.invoke(messages)
-
-        answer = response.content
-
-        # ---------------------------------------------
-        # 출처 정리
-        # ---------------------------------------------
-        sources = []
-        seen = set()
-
-        for doc, score in relevant_results:
-            source = doc.metadata.get(
-                "source",
-                self.filename,
-            )
-            page = doc.metadata.get("page", "?")
-
-            key = (source, page)
-
-            if key not in seen:
-                seen.add(key)
-
-                sources.append(
-                    {
-                        "file": source,
-                        "page": page,
-                        "score": round(float(score), 3),
-                        "excerpt": doc.page_content.strip(),
-                    }
-                )
+        answer = content_to_text(response.content)
 
         return {
             "answer": answer,
@@ -827,10 +988,22 @@ class RAGChain:
         }
 
 
-# =========================================================
-# 7. 여러 PDF → 하나의 RAG 준비
-# =========================================================
-def process_pdfs_and_get_chain(pdf_paths):
+def process_pdfs_and_get_chain(
+    pdf_paths,
+    cache_dir=None,
+    progress_callback=None,
+):
+    """
+    PDF들을 읽어 RAGChain을 만듭니다.
+
+    cache_dir가 주어지면, PDF 내용 해시로 디스크에 저장된 FAISS 인덱스를
+    먼저 찾아봅니다. 캐시가 있으면 임베딩 API 호출 없이 즉시 재사용하고,
+    없으면 새로 임베딩한 뒤 다음을 위해 디스크에 저장합니다.
+    (PDF 텍스트 추출·청크 분할은 API 호출이 아니라서 캐시 여부와 무관하게
+    항상 다시 수행합니다 — RAGChain이 원문 청크를 직접 참조하기 때문입니다.)
+
+    progress_callback(done, total)은 임베딩이 실제로 실행될 때만 호출됩니다.
+    """
     documents = []
     filenames = []
 
@@ -841,7 +1014,29 @@ def process_pdfs_and_get_chain(pdf_paths):
         filenames.append(Path(pdf_path).name)
 
     chunks = split_documents(documents)
-    vectorstore = build_vectorstore(chunks)
+
+    vectorstore = None
+
+    if cache_dir is not None:
+        content_hash = compute_content_hash(pdf_paths)
+        embeddings = get_embeddings()
+        vectorstore = load_cached_vectorstore(
+            cache_dir,
+            content_hash,
+            embeddings,
+        )
+
+        if vectorstore is not None and progress_callback is not None:
+            progress_callback(len(chunks), len(chunks))
+
+    if vectorstore is None:
+        vectorstore = build_vectorstore(
+            chunks,
+            progress_callback=progress_callback,
+        )
+
+        if cache_dir is not None:
+            save_vectorstore_cache(vectorstore, cache_dir, content_hash)
 
     return RAGChain(
         vectorstore=vectorstore,
@@ -850,6 +1045,10 @@ def process_pdfs_and_get_chain(pdf_paths):
     )
 
 
-def process_pdf_and_get_chain(pdf_path: str):
+def process_pdf_and_get_chain(pdf_path: str, cache_dir=None, progress_callback=None):
     """기존 단일 PDF 호출 방식도 계속 지원합니다."""
-    return process_pdfs_and_get_chain([pdf_path])
+    return process_pdfs_and_get_chain(
+        [pdf_path],
+        cache_dir=cache_dir,
+        progress_callback=progress_callback,
+    )

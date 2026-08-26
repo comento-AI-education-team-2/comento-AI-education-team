@@ -2,6 +2,7 @@ python-dotenv
 faiss-cpu
 pymupdf
 langchain-community
-langchain-openai
+langchain-google-genai
 langchain-core
+langchain-text-splitters
 streamlit
