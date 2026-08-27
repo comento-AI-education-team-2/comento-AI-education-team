@@ -71,9 +71,10 @@ def content_to_text(content) -> str:
 
     return str(content)
 
-EMBEDDING_BATCH_SIZE = 100
+EMBEDDING_BATCH_SIZE = 20
+EMBEDDING_BATCH_DELAY = 15
 EMBEDDING_MAX_RETRIES = 3
-EMBEDDING_RETRY_BASE_DELAY = 2
+EMBEDDING_RETRY_BASE_DELAY = 15
 
 CHUNK_SIZE = 700
 CHUNK_OVERLAP = 120
@@ -162,7 +163,7 @@ def _call_with_retry(func, *args, **kwargs):
     """
     임베딩 API 호출용 재시도 헬퍼.
     rate limit, 일시적 네트워크 오류 등에 대비해
-    지수 백오프(2초 → 4초 → 8초)로 최대 3회 재시도합니다.
+    지수 백오프(15초 → 30초 → 60초)로 최대 3회 재시도합니다.
     """
     last_error = None
 
@@ -233,6 +234,15 @@ def build_vectorstore(chunks, progress_callback=None):
 
         if progress_callback is not None:
             progress_callback(done, total)
+
+        if done < total:
+            logger.info(
+                "임베딩 배치 완료 (%d/%d), %d초 대기 후 다음 배치를 처리합니다.",
+                done,
+                total,
+                EMBEDDING_BATCH_DELAY,
+            )
+            time.sleep(EMBEDDING_BATCH_DELAY)
 
     return vectorstore
 
