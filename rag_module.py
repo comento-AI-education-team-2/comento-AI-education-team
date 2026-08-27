@@ -542,7 +542,6 @@ class RAGChain:
 
         self.llm = ChatGoogleGenerativeAI(
             model=CHAT_MODEL,
-            temperature=0,
         )
 
         self.prompt = get_prompt()

@@ -1,8 +1,8 @@
-python-dotenv
-faiss-cpu
-pymupdf
-langchain-community
-langchain-google-genai
-langchain-core
-langchain-text-splitters
-streamlit
+python-dotenv==1.2.3
+faiss-cpu==1.15.0
+pymupdf==1.28.2
+langchain-community==0.4.2
+langchain-google-genai==4.3.6
+langchain-core==1.6.0
+langchain-text-splitters==1.1.2
+streamlit==1.62.0
