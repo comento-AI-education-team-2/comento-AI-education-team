@@ -133,3 +133,7 @@ streamlit run app.py
 
 - 업로드한 PDF·대화 기록은 실행 중인 서버의 로컬 저장소에 보관됩니다.
 - 강의자료 안에서 근거를 찾지 못한 질문에는 의도적으로 답을 지어내지 않습니다.
+
+## 최종 배포 URL
+
+https://comento-ai-education-team-6u3ysphln9jxml5yzen8wl.streamlit.app/
